@@ -1,0 +1,5 @@
+build/
+debug/
+.DS_Store
+hidmedia.X/dist/*
+hidmedia.X/nbproject/Makefile-genesis.properties
