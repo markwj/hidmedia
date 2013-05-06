@@ -81,13 +81,11 @@ unsigned char hid_report_in[HID_INT_IN_EP_SIZE] IN_DATA_BUFFER_ADDRESS_TAG;
 volatile unsigned char hid_report_out[HID_INT_OUT_EP_SIZE] OUT_DATA_BUFFER_ADDRESS_TAG;
 
 #pragma udata
-BYTE old_sw2, old_sw3;
-char buffer[8];
-unsigned char OutBuffer[8];
 USB_HANDLE lastINTransmission;
 USB_HANDLE lastOUTTransmission;
 
-BYTE keypresses,keypresses_last;
+unsigned long keypresses_counter;
+BYTE keypresses,keypresses_spending,keypresses_lpending,keypresses_store;
 typedef struct {
   unsigned dpadDown:1;          // 0x01
   unsigned dpadLeft:1;          // 0x02
@@ -99,9 +97,14 @@ typedef struct {
   unsigned mode:1;              // 0x80
 } keypresses_t;
 #define keypressBits (*((keypresses_t*)&keypresses))
-#define keypressLastBits (*((keypresses_t*)&keypresses_last))
+#define keypressShortPendingBits (*((keypresses_t*)&keypresses_spending))
+#define keypressLongPendingBits (*((keypresses_t*)&keypresses_lpending))
+
+BYTE mode;
+BYTE idler;
 
 /** PRIVATE PROTOTYPES *********************************************/
+BOOL modeIsPressed(void);
 BOOL dpadUpIsPressed(void);
 BOOL dpadDownIsPressed(void);
 BOOL dpadLeftIsPressed(void);
@@ -109,14 +112,29 @@ BOOL dpadRightIsPressed(void);
 BOOL dpadEnterIsPressed(void);
 BOOL topLeftIsPressed(void);
 BOOL topRightIsPressed(void);
+BOOL modeLongPressed(void);
+BOOL dpadUpLongPressed(void);
+BOOL dpadDownLongPressed(void);
+BOOL dpadLeftLongPressed(void);
+BOOL dpadRightLongPressed(void);
+BOOL dpadEnterLongPressed(void);
+BOOL topLeftLongPressed(void);
+BOOL topRightLongPressed(void);
+
 static void InitializeSystem(void);
 void ProcessIO(void);
 void UserInit(void);
 void YourHighPriorityISRCode();
 void YourLowPriorityISRCode();
 void USBCBSendResume(void);
-void KeyboardMediaMode(void);
-void KeyboardCursorMode(void);
+void hid_txkey(BYTE);
+void hid_txkey2(BYTE, BYTE);
+void hid_txconsumer(BYTE);
+
+void KeyboardMode0(void);
+void KeyboardMode1(void);
+
+void KeyboardDebouncer(void);
 
 void USBHIDCBSetReportComplete(void);
 
@@ -380,7 +398,12 @@ void UserInit(void)
   TRISC |= 0b00000111; // Ensrue RC0..RC2 are INPUTs
 
   keypresses = 0;
-  keypresses_last = 0xff;
+  keypresses_spending = 0;
+  keypresses_lpending = 0;
+  keypresses_store = 0;
+  keypresses_counter = 0;
+  mode = 0;
+  idler = 0;
 
   mInitAllLEDs();
 
@@ -416,22 +439,38 @@ void UserInit(void)
  *******************************************************************/
 void ProcessIO(void)
 {
+  KeyboardDebouncer();
+
   // User Application USB tasks
   if ((USBDeviceState < CONFIGURED_STATE) || (USBSuspendControl == 1)) return;
 
-  //Call the function that behaves like a keyboard
-  keypresses = (PORTC << 5) + (PORTA & 0b00011111);
+  switch (mode)
+  {
+  case 0:
+    KeyboardMode0();
+    break;
+  case 1:
+    KeyboardMode1();
+    break;
+  }
 
-  if (keypressBits.mode)
-    KeyboardMediaMode();
-  else
-    KeyboardCursorMode();
+  if (!HIDTxHandleBusy(lastINTransmission)) {
+    if ((idler & 0b11111110) == 0)
+      hid_txconsumer(0x00); // No media key pressed
+    else
+      hid_txkey(0x00); // No key pressed
+    idler++;
+  }
 
 }//end ProcessIO
 
 void hid_txkey(BYTE key)
 {
-  mLED_1_On();
+  if (key == 0)
+    mLED_1_Off()
+  else
+    mLED_1_On();
+
   hid_report_in[0] = 1; //Report ID=1
   hid_report_in[1] = 0; //ModiferKey
   hid_report_in[2] = 0; //Reserved
@@ -444,15 +483,38 @@ void hid_txkey(BYTE key)
   lastINTransmission = HIDTxPacket(HID_EP, (BYTE*) hid_report_in, 0x09);
 }
 
+void hid_txkey2(BYTE key1, BYTE key2)
+{
+  if (key1 == 0)
+    mLED_1_Off()
+  else
+    mLED_1_On();
+
+  hid_report_in[0] = 1; //Report ID=1
+  hid_report_in[1] = 0; //ModiferKey
+  hid_report_in[2] = 0; //Reserved
+  hid_report_in[3] = key1; //HID keycode
+  hid_report_in[4] = key2; //HID keycode
+  hid_report_in[5] = 0;
+  hid_report_in[6] = 0;
+  hid_report_in[7] = 0;
+  hid_report_in[8] = 0;
+  lastINTransmission = HIDTxPacket(HID_EP, (BYTE*) hid_report_in, 0x09);
+}
+
 void hid_txconsumer(BYTE key)
 {
-  mLED_1_On();
+  if (key == 0)
+    mLED_1_Off()
+  else
+    mLED_1_On();
+  
   hid_report_in[0] = 2; //Report ID=2
   hid_report_in[1] = key; // HID keycode
   lastINTransmission = HIDTxPacket(HID_EP, (BYTE*) hid_report_in, 0x02);
 }
 
-void KeyboardMediaMode(void)
+void KeyboardMode0(void)
 {
   //Check if the IN endpoint is not busy, and if it isn't check if we want to send
   //keystroke data to the host.
@@ -460,20 +522,27 @@ void KeyboardMediaMode(void)
   // (MWJ) For example, 0x40 for volume down and 0x20 for volume up.
   if (!HIDTxHandleBusy(lastINTransmission)) {
 
-    if (dpadLeftIsPressed()) {
-      hid_txconsumer(0x02); // Previous Song
+    if (modeIsPressed()||modeLongPressed()) {
+      hid_txkey2(0x65,0x1E); // SEARCH+1
+      mode = 1;
+      }
+    else if (dpadLeftIsPressed()) {
+      hid_txkey2(0x65,0x13); // SEARCH+p = Previous Song
       }
     else if (dpadRightIsPressed()) {
-      hid_txconsumer(0x01); // Next Song
+      hid_txkey2(0x65,0x11); // SEARCH+n = Next Song
       }
     else if (dpadUpIsPressed()) {
-      hid_txconsumer(0x10); // Mute
+      hid_txkey2(0x65,0x04); // SEARCH+a = Music App #1
       }
     else if (dpadDownIsPressed()) {
-      hid_txconsumer(0x04); // Stop
+      hid_txkey2(0x65,0x05); // SEARCH+b = Music App #2
       }
     else if (dpadEnterIsPressed()) {
-      hid_txconsumer(0x08); // Play/Pause
+      hid_txkey2(0x65,0x16); // SEARCH+s = Play/Pause
+      }
+    else if (dpadEnterLongPressed()) {
+      hid_txkey2(0x65,0x19); // SEARCH+v = Voice Control
       }
     else if (topLeftIsPressed()) {
       hid_txconsumer(0x40); // Volume Down
@@ -481,11 +550,10 @@ void KeyboardMediaMode(void)
     else if (topRightIsPressed()) {
       hid_txconsumer(0x20); // Volume Up
       }
-    else {
-      hid_txconsumer(0x00); // No media key pressed
-      mLED_1_Off();
+    else if (topLeftLongPressed()|topRightLongPressed()) {
+      hid_txconsumer(0x10); // Mute
+      }
     }
-  }
 
 
   //Check if any data was sent from the PC to the keyboard device.  Report descriptor allows
@@ -495,18 +563,22 @@ void KeyboardMediaMode(void)
   //SET_REPORT control transfer on EP0.  See the USBHIDCBSetReportHandler() function.
   if (!HIDRxHandleBusy(lastOUTTransmission)) {
     lastOUTTransmission = HIDRxPacket(HID_EP, (BYTE*) & hid_report_out, 1);
-  }
+    }
 
   return;
 }
 
-void KeyboardCursorMode(void)
+void KeyboardMode1(void)
 {
   //Check if the IN endpoint is not busy, and if it isn't check if we want to send
   //keystroke data to the host.
   if (!HIDTxHandleBusy(lastINTransmission)) {
 
-    if (dpadLeftIsPressed()) {
+    if (modeIsPressed()||modeLongPressed()) {
+      hid_txkey2(0x65,0x27); // SEARCH+0
+      mode = 0;
+      }
+    else if (dpadLeftIsPressed()) {
       hid_txkey(0x50); // Left Arrow
       }
     else if (dpadRightIsPressed()) {
@@ -521,17 +593,19 @@ void KeyboardCursorMode(void)
     else if (dpadEnterIsPressed()) {
       hid_txkey(0x28); // ENTER
       }
+    else if (dpadEnterLongPressed()) {
+      hid_txkey2(0x65,0x19); // SEARCH+v = Voice Control
+      }
     else if (topLeftIsPressed()) {
       hid_txkey(0x29); // ESC
       }
-    else if (topRightIsPressed()) {
-      hid_txkey(0x65); // APPLICATION / MENU
+    else if (topLeftLongPressed()||topRightLongPressed()) {
+      hid_txkey(0x4A); // HOME
       }
-    else {
-      hid_txkey(0x00); // No key pressed
-      mLED_1_Off();
+    else if (topRightIsPressed()) {
+      hid_txkey(0x3A); // MENU
+      }
     }
-  }
 
 
   //Check if any data was sent from the PC to the keyboard device.  Report descriptor allows
@@ -546,74 +620,193 @@ void KeyboardCursorMode(void)
   return;
 }
 
+// Debounce logic
+// If a key is pressed
+//   At level 1, store it and wait for release
+//   At level 2, treat it as longpress, set it and wait for release
+// If a key is released
+//   If store != 0, that is our result
+
+#define DEBOUNCE_LEVEL1 1000L
+#define DEBOUNCE_LEVEL2 75000L
+#define DEBOUNCE_LEVEL3 600000L
+
+void KeyboardDebouncer(void)
+{
+  keypresses = (PORTC << 5) + (PORTA & 0b00011111);
+
+  if (keypresses != 0xff) {
+    // One or more keys are pressed
+
+    if (keypresses_counter >= DEBOUNCE_LEVEL3) {
+      return; // Special case - wait for key release
+      }
+    else if (keypresses_counter > DEBOUNCE_LEVEL2) {
+      // It has been held for a long press
+      keypresses_lpending = keypresses ^ 0xff;
+      keypresses_store = 0;
+      keypresses_counter = DEBOUNCE_LEVEL3;
+      }
+    else if (keypresses_counter > DEBOUNCE_LEVEL1) {
+      // It has been held for a short press
+      keypresses_store = keypresses ^ 0xff;
+      keypresses_counter++;
+      }
+    else {
+      keypresses_counter++;
+      }
+    }
+  else {
+    if (keypresses_store != 0) {
+      keypresses_spending = keypresses_store;
+      keypresses_store = 0;
+      }
+    keypresses_counter = 0;
+  }
+}
+
+BOOL modeIsPressed(void)
+{
+  if (keypressShortPendingBits.mode) {
+    keypressShortPendingBits.mode = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
 BOOL dpadUpIsPressed(void)
 {
-  if (keypressBits.dpadUp != keypressLastBits.dpadUp) {
-    keypressLastBits.dpadUp = keypressBits.dpadUp;
-    if (keypressBits.dpadUp == 0)
-      return TRUE;
+  if (keypressShortPendingBits.dpadUp) {
+    keypressShortPendingBits.dpadUp = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL dpadDownIsPressed(void)
 {
-  if (keypressBits.dpadDown != keypressLastBits.dpadDown) {
-    keypressLastBits.dpadDown = keypressBits.dpadDown;
-    if (keypressBits.dpadDown == 0)
-      return TRUE;
+  if (keypressShortPendingBits.dpadDown) {
+    keypressShortPendingBits.dpadDown = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL dpadLeftIsPressed(void)
 {
-  if (keypressBits.dpadLeft != keypressLastBits.dpadLeft) {
-    keypressLastBits.dpadLeft = keypressBits.dpadLeft;
-    if (keypressBits.dpadLeft == 0)
-      return TRUE;
+  if (keypressShortPendingBits.dpadLeft) {
+    keypressShortPendingBits.dpadLeft = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL dpadRightIsPressed(void)
 {
-  if (keypressBits.dpadRight != keypressLastBits.dpadRight) {
-    keypressLastBits.dpadRight = keypressBits.dpadRight;
-    if (keypressBits.dpadRight == 0)
-      return TRUE;
+  if (keypressShortPendingBits.dpadRight) {
+    keypressShortPendingBits.dpadRight = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL dpadEnterIsPressed(void)
 {
-  if (keypressBits.dpadEnter != keypressLastBits.dpadEnter) {
-    keypressLastBits.dpadEnter = keypressBits.dpadEnter;
-    if (keypressBits.dpadEnter == 0)
-      return TRUE;
+  if (keypressShortPendingBits.dpadEnter) {
+    keypressShortPendingBits.dpadEnter = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL topLeftIsPressed(void)
 {
-  if (keypressBits.topLeft != keypressLastBits.topLeft) {
-    keypressLastBits.topLeft = keypressBits.topLeft;
-    if (keypressBits.topLeft == 0)
-      return TRUE;
+  if (keypressShortPendingBits.topLeft) {
+    keypressShortPendingBits.topLeft = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
 }
 
 BOOL topRightIsPressed(void)
 {
-  if (keypressBits.topRight != keypressLastBits.topRight) {
-    keypressLastBits.topRight = keypressBits.topRight;
-    if (keypressBits.topRight == 0)
-      return TRUE;
+  if (keypressShortPendingBits.topRight) {
+    keypressShortPendingBits.topRight = 0;
+    return TRUE;
   }
-  return FALSE; // Was not pressed
+  return FALSE;
+}
+
+BOOL modeLongPressed(void)
+{
+  if (keypressLongPendingBits.mode) {
+    keypressLongPendingBits.mode = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL dpadUpLongPressed(void)
+{
+  if (keypressLongPendingBits.dpadUp) {
+    keypressLongPendingBits.dpadUp = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL dpadDownLongPressed(void)
+{
+  if (keypressLongPendingBits.dpadDown) {
+    keypressLongPendingBits.dpadDown = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL dpadLeftLongPressed(void)
+{
+  if (keypressLongPendingBits.dpadLeft) {
+    keypressLongPendingBits.dpadLeft = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL dpadRightLongPressed(void)
+{
+  if (keypressLongPendingBits.dpadRight) {
+    keypressLongPendingBits.dpadRight = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL dpadEnterLongPressed(void)
+{
+  if (keypressLongPendingBits.dpadEnter) {
+    keypressLongPendingBits.dpadEnter = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL topLeftLongPressed(void)
+{
+  if (keypressLongPendingBits.topLeft) {
+    keypressLongPendingBits.topLeft = 0;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+BOOL topRightLongPressed(void)
+{
+  if (keypressLongPendingBits.topRight) {
+    keypressLongPendingBits.topRight = 0;
+    return TRUE;
+  }
+  return FALSE;
 }
 
 // ******************************************************************************************************
