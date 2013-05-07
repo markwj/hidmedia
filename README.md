@@ -33,7 +33,9 @@ CODE
 ====
 
 Project is here: https://github.com/markwj/hidmedia/
+
 Microchip C18 project is here: https://github.com/markwj/hidmedia/tree/master/hidmedia.X
+
 Hardware schematic is here: https://github.com/markwj/hidmedia/tree/master/hardware
 
 LINKS
